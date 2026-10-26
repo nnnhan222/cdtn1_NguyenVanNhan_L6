@@ -1,64 +1,35 @@
+import sqlite3
+from pathlib import Path
 import pandas as pd
-from sqlalchemy import text
-
-def load_data(df_valid: pd.DataFrame, df_error: pd.DataFrame, engine):
-    """Nạp dữ liệu vào DB, nạp lại không bị nhân đôi (UPSERT)."""
-    with engine.begin() as conn:
-        # Nạp bảng reject
-        if not df_error.empty:
-            for _, row in df_error.iterrows():
-                conn.execute(text("""
-                    INSERT INTO reject_rows (ma_quy_tac, ly_do, du_lieu_goc)
-                    VALUES ('DATA_QUALITY', :ly_do, :du_lieu_goc)
-                """), {"ly_do": row['ly_do'], "du_lieu_goc": str(row.to_dict())})
-        
-        if df_valid.empty:
-            return
-
-        # Load Dimensions (Upsert) & Fact
-        for _, row in df_valid.iterrows():
-            # dim_store
-            res_store = conn.execute(text("""
-                INSERT INTO dim_store (store_code, store_name, city)
-                VALUES (:scode, :sname, :city)
-                ON CONFLICT (store_code) DO UPDATE SET store_name = EXCLUDED.store_name
-                RETURNING store_id
-            """), {"scode": row['store_code'], "sname": row['store_name'], "city": row['city']})
-            store_id = res_store.scalar()
-
-            # dim_product
-            res_prod = conn.execute(text("""
-                INSERT INTO dim_product (product_code, product_name, category)
-                VALUES (:pcode, :pname, :cat)
-                ON CONFLICT (product_code) DO UPDATE SET product_name = EXCLUDED.product_name
-                RETURNING product_id
-            """), {"pcode": row['product_code'], "pname": row['product_name'], "cat": row['category']})
-            prod_id = res_prod.scalar()
-
-            # dim_customer
-            res_cust = conn.execute(text("""
-                INSERT INTO dim_customer (customer_name, phone)
-                VALUES (:cname, :phone)
-                ON CONFLICT (phone) DO UPDATE SET customer_name = EXCLUDED.customer_name
-                RETURNING customer_id
-            """), {"cname": row['customer_name'], "phone": row['customer_phone']})
-            cust_id = res_cust.scalar()
-
-            # dim_date
-            conn.execute(text("""
-                INSERT INTO dim_date (date_key, full_date, month, year)
-                VALUES (:dkey, :fdate, :mon, :yr)
-                ON CONFLICT (date_key) DO NOTHING
-            """), {"dkey": row['date_key'], "fdate": row['order_date'], "mon": row['order_date'].month, "yr": row['order_date'].year})
-
-            # fact_sales (Upsert để không duplicate)
-            conn.execute(text("""
-                INSERT INTO fact_sales (order_code, date_key, store_id, product_id, customer_id, quantity, unit_price, total_amount)
-                VALUES (:ocode, :dkey, :sid, :pid, :cid, :qty, :price, :total)
-                ON CONFLICT (order_code, product_id) DO UPDATE SET 
-                    quantity = EXCLUDED.quantity, total_amount = EXCLUDED.total_amount
-            """), {
-                "ocode": row['order_code'], "dkey": row['date_key'], "sid": store_id,
-                "pid": prod_id, "cid": cust_id, "qty": row['quantity'], 
-                "price": row['unit_price'], "total": row['total_amount']
-            })
+def load_data(result,db_path:Path):
+    db_path.parent.mkdir(parents=True,exist_ok=True)
+    with sqlite3.connect(db_path) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS dim_store(store_code TEXT PRIMARY KEY,store_name TEXT,city TEXT);
+        CREATE TABLE IF NOT EXISTS dim_product(product_code TEXT PRIMARY KEY,product_name TEXT,category TEXT);
+        CREATE TABLE IF NOT EXISTS dim_customer(customer_key TEXT PRIMARY KEY,customer_name TEXT,phone TEXT);
+        CREATE TABLE IF NOT EXISTS dim_date(date_key INTEGER PRIMARY KEY,full_date TEXT,day_of_week TEXT,month INTEGER,quarter INTEGER,year INTEGER);
+        CREATE TABLE IF NOT EXISTS fact_sales(order_item_key TEXT PRIMARY KEY,order_code TEXT,date_key INTEGER,store_code TEXT,product_code TEXT,customer_key TEXT,quantity REAL,unit_price REAL,total_amount REAL);
+        CREATE TABLE IF NOT EXISTS reject_rows(reject_id INTEGER PRIMARY KEY AUTOINCREMENT,source_order_id TEXT,order_code TEXT,store_code TEXT,product_code TEXT,reject_reason TEXT,source_payload TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(source_order_id,product_code,reject_reason));
+        CREATE TABLE IF NOT EXISTS etl_quality(run_id TEXT,check_name TEXT,row_count INTEGER,error_count INTEGER,error_rate REAL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(run_id,check_name));
+        ''')
+        for table,cols in [("dim_store",["store_code","store_name","city"]),("dim_product",["product_code","product_name","category"])]:
+            result["stores" if table == "dim_store" else "products"][cols].drop_duplicates(cols[0]).to_sql("_tmp",con,if_exists="replace",index=False)
+            con.execute(f"INSERT INTO {table} SELECT * FROM _tmp WHERE 1 ON CONFLICT({cols[0]}) DO UPDATE SET "+",".join(f"{c}=excluded.{c}" for c in cols[1:]));con.execute("DROP TABLE _tmp")
+        cust=result["fact"][["customer_key","customer_name","phone"]].drop_duplicates("customer_key")
+        con.execute("CREATE TABLE IF NOT EXISTS _customer(customer_key TEXT PRIMARY KEY,customer_name TEXT,phone TEXT)")
+        cust.to_sql("_customer",con,if_exists="replace",index=False);con.execute("INSERT INTO dim_customer SELECT * FROM _customer WHERE 1 ON CONFLICT(customer_key) DO UPDATE SET customer_name=excluded.customer_name,phone=excluded.phone");con.execute("DROP TABLE _customer")
+        d=result["fact"][["date_key","sale_date","day_of_week","month","quarter","year"]].drop_duplicates("date_key").copy();d["full_date"]=d.pop("sale_date").astype(str);d.to_sql("_d",con,if_exists="replace",index=False)
+        con.execute("INSERT INTO dim_date SELECT * FROM _d WHERE 1 ON CONFLICT(date_key) DO UPDATE SET full_date=excluded.full_date,day_of_week=excluded.day_of_week,month=excluded.month,quarter=excluded.quarter,year=excluded.year");con.execute("DROP TABLE _d")
+        f=result["fact"][["order_item_key","order_code","date_key","store_code","product_code","customer_key","quantity","unit_price","total_amount"]].drop_duplicates("order_item_key")
+        f.to_sql("_f",con,if_exists="replace",index=False);con.execute("INSERT INTO fact_sales SELECT * FROM _f WHERE 1 ON CONFLICT(order_item_key) DO UPDATE SET order_code=excluded.order_code,date_key=excluded.date_key,store_code=excluded.store_code,product_code=excluded.product_code,customer_key=excluded.customer_key,quantity=excluded.quantity,unit_price=excluded.unit_price,total_amount=excluded.total_amount");con.execute("DROP TABLE _f")
+        rej=result["rejects"]
+        if len(rej):
+            rows=rej[["order_id","order_code","store_code","product_code","reject_reason"]].copy();rows=rows.rename(columns={"order_id":"source_order_id"});rows["source_payload"]=rej.astype(str).agg(" | ".join,axis=1).values
+            rows.to_sql("_r",con,if_exists="replace",index=False);con.execute("INSERT OR IGNORE INTO reject_rows(source_order_id,order_code,store_code,product_code,reject_reason,source_payload) SELECT * FROM _r");con.execute("DROP TABLE _r")
+        import uuid
+        run_id=str(uuid.uuid4())
+        con.executemany("INSERT INTO etl_quality(run_id,check_name,row_count,error_count,error_rate) VALUES(?,?,?,?,?)",[(run_id,x["check_name"],x["row_count"],x["error_count"],x["error_rate"]) for x in result["quality"]])
+        count=con.execute("SELECT COUNT(*) FROM fact_sales").fetchone()[0]
+    return {"fact_count":count,"run_id":run_id}
