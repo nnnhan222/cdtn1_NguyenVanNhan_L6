@@ -1,38 +1,24 @@
-import pandas as pd
-from src.transform.transformer import transform_data
-from src.quality.checker import check_quality
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from src.pipeline import run
+from src.transform.transformer import date_value, normalize_phone
 
-def test_luong_dung():
-    """Luồng đúng: Xử lý dòng dữ liệu hoàn toàn hợp lệ."""
-    df = pd.DataFrame([{
-        'order_code': 'ORD01', 'order_date': '2026-10-12', 'customer_phone': '0901234567',
-        'quantity': 2, 'unit_price': 150000, 'store_code': 'ST01', 'product_code': 'P01'
-    }])
-    df_trans = transform_data(df)
-    df_valid, df_err, metrics = check_quality(df_trans)
-    
-    assert len(df_valid) == 1
-    assert len(df_err) == 0
-    assert df_valid.iloc[0]['total_amount'] == 300000
-
-def test_gia_tri_bien():
-    """Giá trị biên: SĐT có định dạng +84 (QT-01)."""
-    df = pd.DataFrame([{
-        'order_code': 'ORD02', 'order_date': '2026-10-12', 'customer_phone': '+84901234567',
-        'quantity': 1, 'unit_price': 100, 'store_code': 'ST', 'product_code': 'P'
-    }])
-    df_trans = transform_data(df)
-    assert df_trans.iloc[0]['customer_phone'] == '0901234567'
-
-def test_du_lieu_sai():
-    """Dữ liệu sai: Số lượng âm (phải vào bảng reject)."""
-    df = pd.DataFrame([{
-        'order_code': 'ORD03', 'order_date': '2026-10-12', 'customer_phone': '0901234567',
-        'quantity': -5, 'unit_price': 100, 'store_code': 'ST', 'product_code': 'P'
-    }])
-    df_trans = transform_data(df)
-    df_valid, df_err, metrics = check_quality(df_trans)
-    
-    assert len(df_valid) == 0
-    assert len(df_err) == 1
-    assert 'Số lượng <=0' in df_err.iloc[0]['ly_do']
+ROOT=Path(__file__).resolve().parents[1]
+class PipelineTests(unittest.TestCase):
+    def test_valid_values(self):
+        self.assertEqual(date_value('17/08/2025'),'2025-08-17')
+        self.assertEqual(normalize_phone('+84 896 790 293'),'0896790293')
+    def test_boundary_date(self):
+        self.assertEqual(date_value('1-1-24'),'2024-01-01')
+    def test_bad_date_rejected_without_crash(self):
+        self.assertIsNone(date_value('not-a-date'))
+    def test_second_load_does_not_duplicate(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=Path(td)/'dw.sqlite'
+            run(ROOT/'data/raw',db);run(ROOT/'data/raw',db)
+            with sqlite3.connect(db) as c:
+                self.assertEqual(c.execute('select count(*) from fact_sales').fetchone()[0],35492)
+                self.assertGreater(c.execute('select count(*) from reject_rows').fetchone()[0],0)
+if __name__=='__main__':unittest.main()
