@@ -1,0 +1,43 @@
+{
+  "run_id": "657c53a0-c399-49a3-88d4-935cf4db0f49",
+  "loaded_fact_rows": 35492,
+  "rejected_rows": 51,
+  "checks": [
+    {
+      "check_name": "required_fields",
+      "row_count": 35697,
+      "error_count": 0,
+      "error_rate": 0.0
+    },
+    {
+      "check_name": "valid_sale_date",
+      "row_count": 35697,
+      "error_count": 154,
+      "error_rate": 0.004314
+    },
+    {
+      "check_name": "positive_quantity_price",
+      "row_count": 35697,
+      "error_count": 0,
+      "error_rate": 0.0
+    },
+    {
+      "check_name": "store_foreign_key",
+      "row_count": 35697,
+      "error_count": 0,
+      "error_rate": 0.0
+    },
+    {
+      "check_name": "product_foreign_key",
+      "row_count": 35697,
+      "error_count": 0,
+      "error_rate": 0.0
+    },
+    {
+      "check_name": "unique_order_item_key",
+      "row_count": 35697,
+      "error_count": 51,
+      "error_rate": 0.001429
+    }
+  ]
+}
